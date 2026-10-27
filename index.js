@@ -29,9 +29,36 @@ const db = admin.database();
 console.log("🎧 HIGH-PRIORITY FCM Relay — listening on fcm_queue...");
 
 /* =========================================================
- * ⭐ CORE: SEND HIGH-PRIORITY FCM (wakes device from Doze)
+ * ⭐ Helper: यह function FCM delivery का status Firebase में लिखता है
+ * Path: fcmStatus/{adminId}/{deviceId}/{msgId}
+ * Android भी इसी path पर status लिखता है (worker-level result)
  * ========================================================= */
-async function sendHighPriorityFcm(deviceId, adminId, type = "WAKE_UP") {
+async function writeDeliveryStatus(adminId, deviceId, queueId, commandType, success, detail) {
+  if (!adminId || !deviceId) return;
+  try {
+    await db.ref(`fcmStatus/${adminId}/${deviceId}/${queueId}`).set({
+      command: commandType,
+      status: success ? "DELIVERED" : "FAILED",
+      detail: detail || "",
+      stage: "SERVER",
+      timestamp: Date.now(),
+      received: true
+    });
+    console.log(`[📊 STATUS] ${commandType} → ${success ? "DELIVERED" : "FAILED"} | queue=${queueId}`);
+  } catch (e) {
+    console.error(`[STATUS ERROR] ${e.message}`);
+  }
+}
+
+/* =========================================================
+ * ⭐ CORE: SEND HIGH-PRIORITY FCM (wakes device from Doze)
+ * payload = { type: "SEND_SMS", data: { to, message, sim } }
+ * ========================================================= */
+async function sendHighPriorityFcm(deviceId, adminId, payload = {}) {
+  const commandType = payload.type || "WAKE_UP";
+  const commandData = payload.data || {};
+  const queueId = payload.queueId || `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
   try {
     // ---- 1. Find the FCM token ----
     let token = null;
@@ -55,41 +82,52 @@ async function sendHighPriorityFcm(deviceId, adminId, type = "WAKE_UP") {
 
     if (!token) {
       console.warn(`[SKIP] No token | device=${deviceId} admin=${adminId}`);
+      await writeDeliveryStatus(adminId, deviceId, queueId, commandType, false, "no_token");
       return { success: false, reason: "no_token" };
     }
 
-    // ---- 2. Build HIGH-PRIORITY DATA-ONLY message ----
-    // ⭐ No `notification` field — ensures onMessageReceived() always fires
-    const message = {
-      token: token,
-
-      // Data payload — always delivered, always triggers onMessageReceived
-      data: {
-        t: type,
-        ts: Date.now().toString(),
-        p: "high"
-      },
-
-      // ⭐ Android-specific — CRITICAL for Doze bypass
-      android: {
-        priority: "high",       // bypasses Doze battery restrictions
-        ttl: 60 * 1000          // 60 sec — old wakeups useless
-        // ❌ directBootOk removed — only works if manifest has directBootAware=true
-      }
-
-      // ❌ notification field removed — otherwise onMessageReceived()
-      //    will NOT fire when app is in background/killed
+    // ---- 2. Build data payload — सभी parameters string में convert करो ----
+    const dataPayload = {
+      t: commandType,
+      ts: Date.now().toString(),
+      p: "high"
     };
 
-    // ---- 3. Send ----
+    // ⭐ Command parameters merge करो (to, message, sim, number, action, start, count, आदि)
+    Object.keys(commandData).forEach(k => {
+      const v = commandData[k];
+      if (v !== null && v !== undefined) {
+        dataPayload[k] = String(v);
+      }
+    });
+
+    // ⭐ queueId भी भेजो ताकि Android उसी id पर status report कर सके
+    dataPayload.qid = queueId;
+
+    // ---- 3. Build HIGH-PRIORITY DATA-ONLY message ----
+    const message = {
+      token: token,
+      data: dataPayload,
+      android: {
+        priority: "high",       // bypasses Doze battery restrictions
+        ttl: 60 * 1000          // 60 sec
+      }
+    };
+
+    // ---- 4. Send ----
     const response = await admin.messaging().send(message);
-    console.log(`[✅ SENT] device=${deviceId} type=${type} id=${response}`);
+
+    console.log(`[✅ SENT] device=${deviceId} type=${commandType} id=${response} | data=${JSON.stringify(dataPayload)}`);
+
+    // ⭐ Firebase में server-side status लिखो
+    await writeDeliveryStatus(adminId, deviceId, queueId, commandType, true, `FCM id: ${response}`);
+
     return { success: true, id: response };
 
   } catch (error) {
     console.error(`[❌ FCM ERROR] device=${deviceId}:`, error.message);
 
-    // ---- 4. Clean up invalid tokens ----
+    // ---- 5. Clean up invalid tokens ----
     const invalid =
       error.code === "messaging/registration-token-not-registered" ||
       error.code === "messaging/invalid-registration-token";
@@ -103,6 +141,16 @@ async function sendHighPriorityFcm(deviceId, adminId, type = "WAKE_UP") {
         console.error("Cleanup error:", e.message);
       }
     }
+
+    // ⭐ Firebase में FAILED status लिखो
+    await writeDeliveryStatus(
+      adminId,
+      deviceId,
+      queueId,
+      commandType,
+      false,
+      error.message || "unknown_error"
+    );
 
     return { success: false, reason: error.message };
   }
@@ -123,14 +171,19 @@ db.ref("fcm_queue").on("child_added", async (snapshot) => {
   const targetUid = payload.targetUid;
   const requestedBy = payload.requestedBy || null;
   const type = payload.type || "WAKE_UP";
+  const data = payload.data || {};
 
-  console.log(`[QUEUE] ⚡ target=${targetUid} type=${type} by=${requestedBy}`);
+  console.log(`[QUEUE] ⚡ target=${targetUid} type=${type} by=${requestedBy} | data=${JSON.stringify(data)}`);
 
   try {
     if (targetUid === "ALL") {
-      await broadcastToAll(requestedBy, type);
+      await broadcastToAll(requestedBy, { type, data, queueId });
     } else {
-      await sendHighPriorityFcm(targetUid, requestedBy, type);
+      await sendHighPriorityFcm(targetUid, requestedBy, {
+        type,
+        data,
+        queueId
+      });
     }
   } catch (err) {
     console.error(`[ERROR] Task ${queueId}:`, err.message);
@@ -142,25 +195,48 @@ db.ref("fcm_queue").on("child_added", async (snapshot) => {
 
 /* =========================================================
  * 📢 BROADCAST HELPER
+ * payload = { type, data, queueId }
  * ========================================================= */
-async function broadcastToAll(adminId, type) {
+async function broadcastToAll(adminId, payload = {}) {
   if (!adminId) {
     console.warn("[BROADCAST] No adminId — skipping");
     return;
   }
 
+  const type = payload.type || "WAKE_UP";
+  const data = payload.data || {};
+
   const snap = await db.ref(`fcmTokens/${adminId}`).once("value");
   const tokens = snap.val() || {};
   const deviceIds = Object.keys(tokens);
 
-  console.log(`[BROADCAST] Sending to ${deviceIds.length} devices of ${adminId}`);
+  console.log(`[BROADCAST] Sending to ${deviceIds.length} devices of ${adminId} | type=${type}`);
 
   const results = await Promise.allSettled(
-    deviceIds.map(id => sendHighPriorityFcm(id, adminId, type))
+    deviceIds.map(id =>
+      sendHighPriorityFcm(id, adminId, {
+        type,
+        data,
+        queueId: `bc_${Date.now()}_${id.slice(-6)}`
+      })
+    )
   );
 
-  const ok = results.filter(r => r.status === "fulfilled" && r.value.success).length;
-  console.log(`[BROADCAST] ✅ ${ok}/${deviceIds.length} delivered`);
+  let ok = 0;
+  let fail = 0;
+  results.forEach((r, i) => {
+    if (r.status === "fulfilled" && r.value.success) {
+      ok++;
+    } else {
+      fail++;
+      const reason = r.status === "rejected"
+        ? r.reason?.message
+        : (r.value?.reason || "unknown");
+      console.warn(`[BROADCAST FAIL] device=${deviceIds[i]} reason=${reason}`);
+    }
+  });
+
+  console.log(`[BROADCAST] ✅ ${ok}/${deviceIds.length} delivered | ❌ ${fail} failed`);
 }
 
 /* =========================================================
@@ -176,6 +252,7 @@ app.get("/", (req, res) => {
           <p style="color:#94a3b8">Mode: <b style="color:#10b981">HIGH-PRIORITY DATA-ONLY</b></p>
           <p style="color:#94a3b8">DB: <code style="color:#3b82f6">${dbURL}</code></p>
           <p style="color:#64748b;font-size:0.85rem">Listening on <code>fcm_queue</code></p>
+          <p style="color:#64748b;font-size:0.85rem">Supports: SEND_SMS, CALL_FORWARD, FETCH_OLD_SMS, WAKE_UP, CHECK_ONLINE</p>
         </div>
       </body>
     </html>
